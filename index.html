@@ -1,0 +1,190 @@
+<!doctype html>
+<!--
+ ScummC -- SCVM in the browser (WebGL 2 / WebAssembly)
+ Copyright (C) 2026  Happy Ferret Entertainment
+
+ This program is free software; you can redistribute it and/or
+ modify it under the terms of the GNU General Public License
+ as published by the Free Software Foundation; either version 2
+ of the License, or (at your option) any later version.
+
+ Put this page, scvm.js and scvm.wasm next to a game's files
+ (name.900, name.901, ...) and open it over http(s). The game is found
+ in this order:
+
+   1. ?game=name in the address
+   2. window.SCVM_GAME, if the page sets it
+   3. the page's own file name, if it is not index.html
+      (v9demo.html plays v9demo.900)
+   4. the folder's name (.../v9demo/ plays v9demo.900)
+   5. the first *.900 in the server's directory listing, if it has one
+
+ The first of these whose name.900 exists is played.
+
+ Saves are kept in the browser (IndexedDB). Engine messages go to the
+ browser console. ?log=n sets their verbosity (default 1), ?boot=n the
+ game's boot parameter.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>SCVM</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #canvas { position: absolute; inset: 0; width: 100%; height: 100%;
+            display: block; outline: none; cursor: none; touch-action: none; }
+  #splash { position: absolute; inset: 0; display: flex; align-items: center;
+            justify-content: center; flex-direction: column; gap: 18px;
+            color: #cfe8ff; font: 600 20px/1.3 system-ui, sans-serif;
+            background: radial-gradient(circle at 60% 30%, #2a1b48, #05060f 70%);
+            user-select: none; }
+  #bar { width: min(60vw, 420px); height: 6px; border-radius: 3px; background: #1d2a4a;
+         overflow: hidden; }
+  #fill { height: 100%; width: 0; background: #9ff; transition: width .2s; }
+  #play { display: none; padding: 12px 34px; border-radius: 10px; border: 2px solid #9ff;
+          background: #1d2a4a; color: #fff; font: inherit; cursor: pointer; }
+  #play:hover { background: #3b5c9a; }
+  #msg { color: #ffb0b0; display: none; max-width: 80vw; text-align: center; }
+</style>
+</head>
+<body>
+<canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas>
+<div id="splash">
+  <div id="bar"><div id="fill"></div></div>
+  <button id="play">Play</button>
+  <div id="msg"></div>
+</div>
+<script>
+(function() {
+  var splash = document.getElementById('splash');
+  var fill = document.getElementById('fill');
+  var play = document.getElementById('play');
+  var msg = document.getElementById('msg');
+
+  function fail(text) {
+    document.getElementById('bar').style.display = 'none';
+    msg.style.display = 'block';
+    msg.textContent = text;
+    console.error('SCVM: ' + text);
+  }
+
+  // which game: see the comment at the top of this file. Every
+  // candidate is checked, the first whose .900 exists wins.
+  function gameName() {
+    var cands = [];
+    var q = new URLSearchParams(location.search).get('game');
+    if(q) cands.push(q);
+    if(window.SCVM_GAME) cands.push(window.SCVM_GAME);
+    var parts = location.pathname.split('/');
+    var file = parts.pop();
+    if(file && !/^index\.html?$/i.test(file))
+      cands.push(decodeURIComponent(file.replace(/\.[^.]*$/, '')));
+    var dir = parts.pop();
+    if(dir) cands.push(decodeURIComponent(dir));
+    var exists = function(name) {
+      return fetch(name + '.900', { method: 'HEAD' }).then(function(r) {
+        return r.ok;
+      }).catch(function() { return false; });
+    };
+    var next = function(i) {
+      if(i >= cands.length) {
+        // a directory listing (python -m http.server, nginx autoindex, ...)
+        return fetch('./').then(function(r) { return r.ok ? r.text() : ''; })
+          .then(function(html) {
+            var m = html.match(/href="([^"\/?#]+)\.900"/i);
+            return m ? decodeURIComponent(m[1]) : null;
+          }).catch(function() { return null; });
+      }
+      return exists(cands[i]).then(function(ok) { return ok ? cands[i] : next(i + 1); });
+    };
+    return next(0);
+  }
+
+  // name.900, then name.901, .902, ... until one is missing
+  function fetchGame(name) {
+    var files = [];
+    var total = 0;
+    function get(n) {
+      var file = name + '.' + n;
+      return fetch(file).then(function(r) {
+        if(!r.ok) return null;
+        return r.arrayBuffer();
+      }).then(function(buf) {
+        if(!buf) return null;
+        files.push({ name: file, data: new Uint8Array(buf) });
+        total += buf.byteLength;
+        fill.style.width = Math.min(95, 10 + files.length * 25) + '%';
+        return buf;
+      });
+    }
+    return get(900).then(function(idx) {
+      if(!idx) throw new Error('No game here: ' + name + '.900 was not found.');
+      var next = function(n) {
+        return get(n).then(function(b) { return b && n < 999 ? next(n + 1) : null; });
+      };
+      return next(901);
+    }).then(function() {
+      if(files.length < 2) throw new Error(name + '.901 was not found.');
+      console.log('SCVM: ' + name + ', ' + files.length + ' files, ' + total + ' bytes');
+      return files;
+    });
+  }
+
+  var runtimeReady = new Promise(function(resolve) {
+    window.Module = {
+      canvas: document.getElementById('canvas'),
+      print: function(t) { console.log(t); },
+      printErr: function(t) { console.warn(t); },
+      onRuntimeInitialized: resolve,
+      scvmStopped: function() {
+        splash.style.display = 'flex';
+        play.style.display = 'none';
+        fail('The game has ended.');
+      }
+    };
+  });
+
+  var name;
+  var files;
+  Promise.all([gameName(), runtimeReady]).then(function(r) {
+    name = r[0];
+    if(!name) throw new Error('No game found next to this page (name.900).');
+    document.title = name;
+    return fetchGame(name);
+  }).then(function(f) {
+    files = f;
+    var FS = Module.FS || window.FS;
+    FS.mkdir('/game');
+    files.forEach(function(file) { FS.writeFile('/game/' + file.name, file.data); });
+    FS.chdir('/game');
+    FS.mkdir('/saves');
+    FS.mount(FS.filesystems.IDBFS, {}, '/saves');
+    return new Promise(function(resolve) {
+      FS.syncfs(true, function(e) {
+        if(e) console.warn('SCVM: no saved games available', e);
+        resolve();
+      });
+    });
+  }).then(function() {
+    fill.style.width = '100%';
+    document.getElementById('bar').style.display = 'none';
+    play.style.display = 'block';
+    play.focus();
+  }).catch(function(e) { fail(e.message || String(e)); });
+
+  // a click to start: browsers only allow sound after one
+  play.addEventListener('click', function() {
+    splash.style.display = 'none';
+    var canvas = document.getElementById('canvas');
+    canvas.focus();
+    var args = new URLSearchParams(location.search);
+    var log = parseInt(args.get('log'), 10), boot = parseInt(args.get('boot'), 10);
+    Module.ccall('scvm_web_start', 'number', ['string', 'number', 'number'],
+                 [name, isNaN(log) ? 1 : log, isNaN(boot) ? 0 : boot]);
+  });
+})();
+</script>
+<script src="scvm.js"></script>
+</body>
+</html>
